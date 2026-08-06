@@ -1,0 +1,872 @@
+%% =========================================================================
+%  METHALOX ROCKET ENGINE & INJECTOR SIZING  —  Preliminary Design Tool
+%  =========================================================================
+%
+%  Covers:
+%    1. Nozzle / thrust chamber sizing  (isentropic 1-D analysis)
+%    2. Injector sizing                 (orifice CdA method, coaxial-swirl)
+%    3. Results summary table + plots
+%
+%  KEY REFERENCES (cited inline as [R#]):
+%    [R1] Sutton & Biblarz — "Rocket Propulsion Elements" 9th ed. Wiley 2017
+%    [R2] NASA GRC — "Rocket Thrust Equations"
+%         https://www.grc.nasa.gov/www/k-12/airplane/rktthsum.html
+%    [R3] Huzel & Huang — "Modern Engineering for Design of LPREs" AIAA 1992
+%    [R4] NASA NTRS 20100033271 — Betts & Frederick, "Throttling Study" 2010
+%    [R5] NASA NTRS 20190001326 — "Mass Flow Rate and Isolation
+%         Characteristics of Injectors" 2019
+%    [R6] MIT Rocket Team Wiki — "Injector Design Guide" 2020
+%    [R7] Krzycki — "How to Design Small Liquid-Fuel Rocket Engines" 1967
+%    [R8] Yang et al. — "Liquid Rocket Engine Combustion Instability"
+%         AIAA Progress Series Vol.169, 1995
+%    [R9] Bazarov — "LP Rocket Engine Injector Design" (cited in Sharma
+%         et al., Int. J. Fluid Mech. Res., 2025)
+%    [R10] Wikipedia — "Regenerative cooling (rocketry)" — Bartz equation
+%          form, heat flux range (0.8-80 MW/m²), Dittus-Boelter reference
+%          https://en.wikipedia.org/wiki/Regenerative_cooling_(rocketry)
+%    [R11] Pizzarelli, M. — "Regenerative Cooling of Liquid Rocket Engine
+%          Thrust Chambers" review; channel aspect-ratio trade-off studies
+%          (e.g. AIAA J. Thermophysics & Heat Transfer)
+%    [R12] Huzel & Huang — NASA SP-125, "Design of Liquid Propellant
+%          Rocket Engines" — wall materials, channel design practice
+%    [R13] Ruan, B. & Meng, H. — "Supercritical Heat Transfer of
+%          Cryogenic-Propellant Methane in Rectangular Engine Cooling
+%          Channels" J. Thermophysics & Heat Transfer, Vol.26 No.2, 2012
+%
+%  ── BUG FIXES vs previous version ───────────────────────────────────────
+%
+%  BUG 1 (CRITICAL — imaginary numbers):
+%    The original code back-calculated A* using:
+%      Astar = F_vac / (mdot_per_Astar*Ve + (Pe-Pa)*eps)
+%    When Pa > 0 (sea level) and eps is large, the nozzle is heavily
+%    overexpanded: Pe << Pa.  The pressure-thrust term (Pe-Pa)*Ae is then
+%    a large NEGATIVE number and can make the entire denominator negative,
+%    producing a negative A* and imaginary square roots everywhere.
+%
+%    ROOT CAUSE: F_vac is the VACUUM thrust, but Pa was included in the
+%    denominator, creating a physically inconsistent equation.
+%
+%    FIX: Always size A* from vacuum thrust alone (set Pa=0 in A* equation):
+%      Astar = F_vac / (mdot_per_Astar*Ve + Pe*eps)   % Pa=0 for vacuum
+%    Then compute the ACTUAL sea-level (or altitude) thrust separately:
+%      F_alt = mdot*Ve + (Pe-Pa)*Ae
+%    This is now consistent: F_vac is the true vacuum thrust target,
+%    F_alt is an OUTPUT showing actual thrust at the specified altitude.
+%
+%  BUG 2 (input mismatch warning):
+%    eps=40 at sea level gives Pe ≈ 0.04 bar vs Pa=1.013 bar — the nozzle
+%    is 26× overexpanded.  At SL, use eps ≤ ~10 for reasonable performance.
+%    The code now prints a warning if Pe/Pa < 0.3 (heavy overexpansion).
+%
+% =========================================================================
+clear; clc; close all;
+
+%% =========================================================================
+%  SECTION 0: PHYSICAL CONSTANTS
+% =========================================================================
+g0  = 9.80665;      % Standard gravity [m/s²]
+Ru  = 8314.46;      % Universal gas constant [J/(kmol·K)]
+
+%% =========================================================================
+%  SECTION 1: INPUT PARAMETERS
+% =========================================================================
+%  ── Mission targets ──────────────────────────────────────────────────────
+F_vac  = 20e3;      % VACUUM thrust target [N]
+%                     A* is always sized to this. Sea-level thrust is derived.
+Pc     = 20.353e5;   % [Pa] — from CEA comb end
+eps    = 40;        % Nozzle expansion ratio Ae/A*
+OF     = 3.6;       % Oxidiser-to-fuel mass ratio
+Pa     = 101325;    % Ambient pressure [Pa]  (0 = vacuum, 101325 = sea level)
+%                     Used ONLY to report F_alt and check over/under-expansion.
+%                     It does NOT affect A* sizing (see BUG FIX 1 above).
+
+%  ── Propellant thermochemistry (CH4/LOx at O/F ≈ 3.6–3.8) ───────────────
+% Values from NASA CEA at Comb End
+Tc      = 3395;        % Adiabatic flame temperature - 
+%                        Chamber stagnation temperature[K]
+gamma   = 1.123;        % Ratio of specific heats γ of combustion products
+Mw_g   = 21.836e-3;     % Molecular weight  [kg/mol]
+%  [ Orginial values from R1 Table 5-1; FIRGELLI Rocket Thrust Calculator]
+
+
+%  ── Combustion chamber geometry ──────────────────────────────────────────
+Lstar = 1.2;        % Characteristic length L* [m]  (0.5–1.5 for CH4/O2)
+Cc    = 5.0;        % Contraction ratio Ac/A*
+
+%  ── Efficiencies ─────────────────────────────────────────────────────────
+eta_cstar = 0.96;   % c* efficiency (combustion completeness)  [R1 §3]
+eta_CF    = 0.98;   % CF efficiency (divergence, BL, friction) [R1 §3]
+
+%  ── Injector parameters ──────────────────────────────────────────────────
+dPinj_frac = 0.20;  % Injector ΔP / Pc — "stiffness ratio" [R4]
+Cd_ox      = 0.70;  % Discharge coeff, LOx orifices [R1 §9; R7]
+Cd_fuel    = 0.70;  % Discharge coeff, CH4 orifices
+N_elements = 19;    % Number of injector elements (hex packing: 1+6+12)
+rho_ox     = 1141;  % LOx density [kg/m³] at ~90 K  [R1 App. A]
+rho_fuel   = 424;   % LCH4 density [kg/m³] at ~111 K [R1 App. A]
+N_slots_ox = 4;     % Tangential LOx swirl slots per element
+
+%% =========================================================================
+%  SECTION 2: DERIVED CONSTANTS
+% =========================================================================
+R = Ru / (Mw_g * 1000);   % Specific gas constant [J/(kg·K)]
+
+%% =========================================================================
+%  SECTION 3: NOZZLE / THRUST CHAMBER SIZING
+% =========================================================================
+fprintf('=================================================================\n');
+fprintf('  METHALOX ENGINE SIZING — Thrust Chamber\n');
+fprintf('=================================================================\n\n');
+
+%  ── Step 3.1: Exit Mach from area ratio (Newton-Raphson) ─────────────────
+%
+%  Isentropic area-ratio relation [R1 eq. 3-13]:
+%    Ae/A* = (1/Me) * [(2/(γ+1))*(1+(γ-1)/2*Me²)]^[(γ+1)/(2(γ-1))]
+%  Transcendental in Me → Newton-Raphson on the supersonic root (Me > 1).
+
+Me = 2.0;
+for iter = 1:300
+    AR   = area_ratio(Me, gamma);
+    dAR  = (area_ratio(Me+1e-7,gamma) - area_ratio(Me-1e-7,gamma)) / 2e-7;
+    step = (AR - eps) / dAR;
+    Me   = max(Me - step, 1.001);
+    if abs(step) < 1e-11; break; end
+end
+fprintf('  Exit Mach Me        = %.4f\n', Me);
+
+%  ── Step 3.2: Isentropic exit conditions ─────────────────────────────────
+%
+%  [R1 eq. 3-14, 3-15]:
+%    Pe = Pc * [1 + (γ-1)/2 * Me²]^(-γ/(γ-1))
+%    Te = Tc * [1 + (γ-1)/2 * Me²]^(-1)
+%    Ve = Me * sqrt(γ * R * Te)
+
+Pe = Pc * (1 + (gamma-1)/2 * Me^2)^(-gamma/(gamma-1));
+Te = Tc * (1 + (gamma-1)/2 * Me^2)^(-1);
+Ve = Me * sqrt(gamma * R * Te);
+fprintf('  Exit pressure Pe    = %.5f bar\n', Pe/1e5);
+fprintf('  Exit temperature Te = %.1f K\n', Te);
+fprintf('  Exit velocity Ve    = %.1f m/s\n', Ve);
+
+%  Expansion check — warn if heavily over/under-expanded at ambient
+if Pa > 0
+    pe_pa = Pe / Pa;
+    if pe_pa < 0.30
+        fprintf('\n  *** OVEREXPANSION WARNING ***\n');
+        fprintf('  Pe/Pa = %.4f — nozzle is %.1fx overexpanded at Pa=%.0f Pa.\n', ...
+                pe_pa, 1/pe_pa, Pa);
+        fprintf('  For sea-level operation consider eps < %.0f to match Pe~Pa.\n', ...
+                eps * (Pa/Pe)^0.5);
+        fprintf('  Vacuum thrust target (F_vac) is still valid; sea-level\n');
+        fprintf('  thrust will be much lower (or negative) due to overexpansion.\n\n');
+    elseif pe_pa > 3.0
+        fprintf('\n  *** UNDEREXPANSION WARNING ***\n');
+        fprintf('  Pe/Pa = %.2f — increase eps for better performance.\n\n', pe_pa);
+    end
+end
+
+%  ── Step 3.3: Choked throat mass flux ────────────────────────────────────
+%
+%  Vandenkerckhove function Γ [R1 eq. 3-24]:
+%    Γ = sqrt(γ) * (2/(γ+1))^[(γ+1)/(2(γ-1))]
+%    ṁ/A* = Pc * Γ / sqrt(R*Tc)
+
+Gamma_vdk      = sqrt(gamma) * (2/(gamma+1))^((gamma+1)/(2*(gamma-1)));
+mdot_per_Astar = Pc * Gamma_vdk / sqrt(R * Tc);
+
+%  ── Step 3.4: Throat area — always sized from VACUUM thrust ──────────────
+%
+%  Full thrust equation [R1 eq. 2-13; R2]:
+%    F = ṁ*Ve + (Pe - Pa)*Ae
+%
+%  KEY: F_vac is defined at Pa=0. We MUST set Pa=0 here to get a
+%  consistent A*.  If Pa were included, a large negative (Pe-Pa)*Ae term
+%  for overexpanded nozzles would make the denominator negative → A* < 0
+%  → imaginary numbers everywhere.  (This was the original bug.)
+%
+%  Substituting ṁ=mdot_per_Astar*A* and Ae=eps*A* with Pa=0:
+%    F_vac = A* * [mdot_per_Astar*Ve + Pe*eps]
+%    A*    = F_vac / [mdot_per_Astar*Ve + Pe*eps]
+
+denom_vac  = mdot_per_Astar * Ve + Pe * eps;   % Pa = 0 here — intentional
+Astar      = (F_vac / denom_vac) / (eta_cstar * eta_CF);  % efficiency correction
+mdot       = mdot_per_Astar * Astar;
+
+%  Actual thrust at operating altitude (Pa may be > 0):
+%    F_alt = ṁ*Ve + (Pe-Pa)*Ae
+Ae     = eps * Astar;
+F_alt  = mdot * Ve + (Pe - Pa) * Ae;
+
+%  ── Step 3.5: Performance metrics ────────────────────────────────────────
+cstar_real = Pc * Astar / mdot * eta_cstar;
+CF_ideal   = F_vac / (Pc * Astar);
+CF_real    = CF_ideal * eta_CF;
+Isp_vac    = F_vac / (mdot * g0);
+Isp_alt    = F_alt  / (mdot * g0);   % Isp at ambient Pa
+
+%  ── Step 3.6: Geometry ───────────────────────────────────────────────────
+Ac    = Cc * Astar;
+Dstar = 2*sqrt(Astar/pi);
+De    = 2*sqrt(Ae/pi);
+Dc    = 2*sqrt(Ac/pi);
+Vc    = Lstar * Astar;
+Lc    = Vc / Ac;
+
+mdot_ox   = mdot * OF / (1 + OF);
+mdot_fuel = mdot          / (1 + OF);
+
+%  ── Print results ─────────────────────────────────────────────────────────
+fprintf('\n  --- Performance ---\n');
+fprintf('  Isp (vacuum)        = %.1f s\n',   Isp_vac);
+fprintf('  Isp (at Pa=%.0f Pa) = %.1f s\n',   Pa, Isp_alt);
+fprintf('  c* (real)           = %.1f m/s\n', cstar_real);
+fprintf('  CF (ideal/real)     = %.4f / %.4f\n', CF_ideal, CF_real);
+fprintf('  Thrust (vacuum)     = %.1f N\n',   F_vac);
+fprintf('  Thrust at Pa=%.0fPa = %.1f N\n',   Pa, F_alt);
+fprintf('  Total mass flow     = %.4f kg/s\n', mdot);
+fprintf('  Oxidiser flow       = %.4f kg/s\n', mdot_ox);
+fprintf('  Fuel flow           = %.4f kg/s\n', mdot_fuel);
+
+fprintf('\n  --- Nozzle Geometry ---\n');
+fprintf('  Throat area  A*     = %.4f cm²\n',  Astar*1e4);
+fprintf('  Throat diam  d*     = %.2f mm\n',   Dstar*1e3);
+fprintf('  Exit area    Ae     = %.2f cm²\n',  Ae*1e4);
+fprintf('  Exit diam    De     = %.2f mm\n',   De*1e3);
+
+fprintf('\n  --- Chamber Geometry ---\n');
+fprintf('  Chamber vol  Vc     = %.3f L\n',    Vc*1e3);
+fprintf('  Chamber diam Dc     = %.2f mm\n',   Dc*1e3);
+fprintf('  Chamber len  Lc     = %.2f mm\n',   Lc*1e3);
+fprintf('  L*                  = %.2f m\n',    Lstar);
+fprintf('  Contraction ratio   = %.1f\n',      Cc);
+
+%% =========================================================================
+%  SECTION 4: INJECTOR SIZING — ORIFICE CdA METHOD
+%  ─────────────────────────────────────────────────────────────────────────
+%
+%  ORIFICE FLOW EQUATION [R1 eq.9-2; R5; R7]:
+%    ṁ = Cd * A_orif * sqrt(2 * ρ * ΔP)
+%  → A_orif = ṁ / (Cd * sqrt(2 * ρ * ΔP))
+%
+%  Stiffness rule: ΔP_inj/Pc = 15–20% [R4; R6] decouples feed system
+%  acoustics from chamber, suppressing feed-coupled instability [R8].
+% =========================================================================
+fprintf('\n=================================================================\n');
+fprintf('  INJECTOR SIZING\n');
+fprintf('=================================================================\n\n');
+
+%  ── Step 4.1: Pressure drops ─────────────────────────────────────────────
+dP_ox   = dPinj_frac * Pc;
+dP_fuel = dPinj_frac * Pc;
+fprintf('  Inj. ΔP (ox/fuel)   = %.2f / %.2f bar  (%.0f%% Pc)\n', ...
+        dP_ox/1e5, dP_fuel/1e5, dPinj_frac*100);
+fprintf('  Feed P required (ox)= %.2f bar\n', (Pc+dP_ox)/1e5);
+fprintf('  Feed P req. (fuel)  = %.2f bar\n', (Pc+dP_fuel)/1e5);
+
+%  ── Step 4.2: Per-element flow ───────────────────────────────────────────
+mdot_ox_elem   = mdot_ox   / N_elements;
+mdot_fuel_elem = mdot_fuel / N_elements;
+fprintf('\n  N elements          = %d\n',    N_elements);
+fprintf('  ṁ ox / element     = %.5f kg/s\n', mdot_ox_elem);
+fprintf('  ṁ fuel / element   = %.5f kg/s\n', mdot_fuel_elem);
+
+%  ── Step 4.3: Orifice areas ──────────────────────────────────────────────
+A_ox_total   = mdot_ox_elem   / (Cd_ox   * sqrt(2 * rho_ox   * dP_ox));
+A_fuel_total = mdot_fuel_elem / (Cd_fuel * sqrt(2 * rho_fuel * dP_fuel));
+d_ox_equiv   = 2*sqrt(A_ox_total  /pi);
+d_fuel_equiv = 2*sqrt(A_fuel_total/pi);
+
+fprintf('\n  --- Per-element orifice areas ---\n');
+fprintf('  LOx  total area     = %.4f mm²  (d_eq = %.3f mm)\n', A_ox_total*1e6, d_ox_equiv*1e3);
+fprintf('  CH4  total area     = %.4f mm²  (d_eq = %.3f mm)\n', A_fuel_total*1e6, d_fuel_equiv*1e3);
+
+%  ── Step 4.4: Swirl element layout ───────────────────────────────────────
+A_ox_slot  = A_ox_total / N_slots_ox;
+d_ox_slot  = 2*sqrt(A_ox_slot/pi);
+
+D_post_ox_inner = 2.0 * d_ox_equiv;
+D_post_ox_outer = 1.2 * D_post_ox_inner;
+D_fuel_inner    = D_post_ox_outer;
+D_fuel_outer    = sqrt(D_fuel_inner^2 + 4*A_fuel_total/pi);
+pitch           = sqrt(Ac / (N_elements * pi/4));
+
+fprintf('\n  --- Swirl-coaxial element sizing ---\n');
+fprintf('  N LOx swirl slots   = %d\n',           N_slots_ox);
+fprintf('  Area / LOx slot     = %.4f mm²  (d = %.3f mm)\n', A_ox_slot*1e6, d_ox_slot*1e3);
+fprintf('  LOx post ID / OD    = %.2f / %.2f mm\n', D_post_ox_inner*1e3, D_post_ox_outer*1e3);
+fprintf('  Fuel annulus ID/OD  = %.2f / %.2f mm\n', D_fuel_inner*1e3, D_fuel_outer*1e3);
+fprintf('  Element pitch       = %.2f mm\n',         pitch*1e3);
+
+if D_fuel_outer > pitch
+    fprintf('  *** WARNING: element OD (%.2f mm) > pitch (%.2f mm). Increase N_elements. ***\n', ...
+            D_fuel_outer*1e3, pitch*1e3);
+else
+    fprintf('  Packing check: OD %.2f mm < pitch %.2f mm  [OK]\n', D_fuel_outer*1e3, pitch*1e3);
+end
+
+%  ── Step 4.5: Injection velocities & momentum ratio ──────────────────────
+v_ox_inj   = Cd_ox   * sqrt(2 * dP_ox   / rho_ox);
+v_fuel_inj = Cd_fuel * sqrt(2 * dP_fuel / rho_fuel);
+J_mom = (rho_fuel * v_fuel_inj^2) / (rho_ox * v_ox_inj^2);
+
+fprintf('\n  LOx  injection vel  = %.2f m/s\n', v_ox_inj);
+fprintf('  CH4  injection vel  = %.2f m/s\n',  v_fuel_inj);
+fprintf('  Momentum ratio J    = %.3f  (target 5–20 for LCSCI)\n', J_mom);
+if J_mom < 2
+    fprintf('  *** NOTE: J < 2 — fuel ΔP or density may need tuning ***\n');
+end
+
+%  ── Step 4.6: Reynolds number check ──────────────────────────────────────
+mu_ox   = 1.95e-4;   % LOx dynamic viscosity [Pa·s]  [R1 App.A]
+mu_fuel = 1.10e-4;   % LCH4 dynamic viscosity [Pa·s]
+Re_ox   = rho_ox   * v_ox_inj   * d_ox_slot   / mu_ox;
+Re_fuel = rho_fuel * v_fuel_inj * d_fuel_equiv / mu_fuel;
+fprintf('\n  Re (LOx slot)       = %.2e  (guideline: ≥1e5)\n', Re_ox);
+fprintf('  Re (CH4 annulus)    = %.2e  (guideline: ≥1e5)\n',  Re_fuel);
+if Re_ox < 1e5
+    fprintf('  *** WARNING: LOx Re < 1e5 — Cd may be unstable ***\n');
+end
+
+%% =========================================================================
+%  SECTION 5: DESIGN SUMMARY
+% =========================================================================
+fprintf('\n=================================================================\n');
+fprintf('  DESIGN SUMMARY\n');
+fprintf('=================================================================\n');
+params = {
+    'Thrust (vacuum)',     F_vac,             'N';
+    'Thrust (at altitude)',F_alt,             'N';
+    'Chamber pressure Pc', Pc/1e5,            'bar';
+    'Expansion ratio eps', eps,               '';
+    'O/F ratio',           OF,                '';
+    'Isp (vacuum)',        Isp_vac,           's';
+    'Isp (altitude)',      Isp_alt,           's';
+    'c* (effective)',      cstar_real,        'm/s';
+    'Total mass flow',     mdot,              'kg/s';
+    'Throat area A*',      Astar*1e4,         'cm2';
+    'Throat diam d*',      Dstar*1e3,         'mm';
+    'Exit diam De',        De*1e3,            'mm';
+    'Chamber diam Dc',     Dc*1e3,            'mm';
+    'Chamber length Lc',   Lc*1e3,            'mm';
+    'Injector elements',   N_elements,        '';
+    'Injector dP',         dP_ox/1e5,         'bar';
+    'LOx post ID',         D_post_ox_inner*1e3,'mm';
+    'Fuel annulus OD',     D_fuel_outer*1e3,  'mm';
+};
+fprintf('  %-26s %12s  %s\n','Parameter','Value','Unit');
+fprintf('  %s\n', repmat('-',1,48));
+for k = 1:size(params,1)
+    fprintf('  %-26s %12.3f  %s\n', params{k,1}, params{k,2}, params{k,3});
+end
+fprintf('=================================================================\n\n');
+
+%% =========================================================================
+%  SECTION 6: PLOTS
+% =========================================================================
+
+%  ── Plot 1: Nozzle meridional profile ────────────────────────────────────
+Dc_mm    = Dc*1e3;   Dstar_mm = Dstar*1e3;   De_mm = De*1e3;
+Lc_mm    = Lc*1e3;
+Lconv_mm = 1.5 * Dstar_mm;
+Ldiv_mm  = 3.0 * Dstar_mm * sqrt(eps);
+
+x_ch = linspace(0, Lc_mm, 50);          r_ch = ones(size(x_ch))*Dc_mm/2;
+x_cv = linspace(Lc_mm, Lc_mm+Lconv_mm, 50); r_cv = linspace(Dc_mm/2,Dstar_mm/2,50);
+x_dv = linspace(Lc_mm+Lconv_mm, Lc_mm+Lconv_mm+Ldiv_mm, 100);
+t_dv = (x_dv-x_dv(1))/(x_dv(end)-x_dv(1));
+r_dv = Dstar_mm/2 + (De_mm/2-Dstar_mm/2)*(3*t_dv.^2-2*t_dv.^3);
+
+x_all = [x_ch, x_cv(2:end), x_dv(2:end)];
+r_all = [r_ch, r_cv(2:end), r_dv(2:end)];
+
+figure('Name','Nozzle Profile','NumberTitle','off','Color','white');
+patch([x_all fliplr(x_all)],[r_all -fliplr(r_all)],[.85 .90 .95],...
+      'EdgeColor','none','FaceAlpha',0.5); hold on;
+plot(x_all, r_all,'b-','LineWidth',2);
+plot(x_all,-r_all,'b-','LineWidth',2);
+plot([0 x_all(end)],[0 0],'k--','LineWidth',0.8);
+xline(Lc_mm,':','Color',[.5 .5 .5],'LineWidth',1);
+xline(Lc_mm+Lconv_mm,':','Color',[.5 .5 .5],'LineWidth',1);
+text(Lc_mm/2,       Dc_mm/2+1,   'Chamber',   'HorizontalAlignment','center','FontSize',9);
+text(Lc_mm+Lconv_mm/2,Dstar_mm+1,'Conv.',     'HorizontalAlignment','center','FontSize',9);
+text(Lc_mm+Lconv_mm+Ldiv_mm/2,De_mm/2+1,'Divergent','HorizontalAlignment','center','FontSize',9);
+xlabel('Axial position [mm]'); ylabel('Radius [mm]');
+title('Nozzle Meridional Profile'); grid on; axis equal;
+
+%  ── Plot 2: Isp vs expansion ratio ───────────────────────────────────────
+eps_range = linspace(2,200,300);
+Isp_vac_r = zeros(size(eps_range));
+Isp_alt_r = zeros(size(eps_range));
+for k = 1:length(eps_range)
+    Me_k  = solve_mach(eps_range(k), gamma);
+    Pe_k  = Pc*(1+(gamma-1)/2*Me_k^2)^(-gamma/(gamma-1));
+    Te_k  = Tc*(1+(gamma-1)/2*Me_k^2)^(-1);
+    Ve_k  = Me_k*sqrt(gamma*R*Te_k);
+    Ast_k = (F_vac/(mdot_per_Astar*Ve_k + Pe_k*eps_range(k)))/(eta_cstar*eta_CF);
+    md_k  = mdot_per_Astar*Ast_k;
+    Isp_vac_r(k) = F_vac / (md_k*g0);
+    F_alt_k = md_k*Ve_k + (Pe_k-Pa)*eps_range(k)*Ast_k;
+    Isp_alt_r(k) = F_alt_k / (md_k*g0);
+end
+
+figure('Name','Isp vs Expansion Ratio','NumberTitle','off','Color','white');
+plot(eps_range, Isp_vac_r,'b-','LineWidth',2); hold on;
+plot(eps_range, Isp_alt_r,'r-','LineWidth',2);
+xline(eps,'k--','LineWidth',1.5);
+scatter(eps, Isp_vac, 80,'b','filled');
+scatter(eps, Isp_alt, 80,'r','filled');
+yline(0,'k:','LineWidth',0.8);
+legend({'I_{sp} vacuum','I_{sp} at altitude'},'Location','southeast');
+xlabel('Expansion ratio \epsilon'); ylabel('I_{sp} [s]');
+title(sprintf('I_{sp} vs Expansion Ratio  (Pc=%.0f bar, Pa=%.0f Pa)',Pc/1e5,Pa));
+grid on;
+
+%  ── Plot 3: Injector ΔP stiffness map ────────────────────────────────────
+dP_range = linspace(0.05,0.40,200)*Pc;
+A_ox_r   = mdot_ox_elem   ./(Cd_ox   *sqrt(2*rho_ox  *dP_range));
+A_fu_r   = mdot_fuel_elem ./(Cd_fuel *sqrt(2*rho_fuel*dP_range));
+
+figure('Name','Injector Sizing Map','NumberTitle','off','Color','white');
+yyaxis left;  plot(dP_range/1e5, A_ox_r*1e6,'b-','LineWidth',2);
+ylabel('LOx orifice area / element [mm²]');
+yyaxis right; plot(dP_range/1e5, A_fu_r*1e6,'r-','LineWidth',2);
+ylabel('CH_4 orifice area / element [mm²]');
+hold on; xline(dP_ox/1e5,'k--','LineWidth',1.5);
+text(dP_ox/1e5+1, max(A_ox_r*1e6)*0.85, ...
+    sprintf('Design ΔP\n%.1f bar (%.0f%% Pc)',dP_ox/1e5,dPinj_frac*100),'FontSize',9);
+xlabel('Injector ΔP [bar]');
+title('Orifice Area vs Injector Pressure Drop (per element)');
+legend({'LOx area','CH_4 area'},'Location','northeast');
+grid on;
+
+%  ── Plot 4: Coaxial swirl element cross-section ───────────────────────────
+figure('Name','Coaxial Swirl Element','NumberTitle','off','Color','white');
+hold on; axis equal; axis off;
+theta = linspace(0,2*pi,200);
+r1 = D_post_ox_inner/2*1e3;
+r2 = D_post_ox_outer/2*1e3;
+r3 = D_fuel_outer/2*1e3;
+
+fill(r3*cos(theta),r3*sin(theta),[.9 .4 .2],'FaceAlpha',.2,'EdgeColor',[.8 .2 0],'LineWidth',1.5);
+fill(r2*cos(theta),r2*sin(theta),[.7 .7 .7],'EdgeColor',[.4 .4 .4],'LineWidth',1.5);
+fill(r1*cos(theta),r1*sin(theta),[.2 .5 .9],'FaceAlpha',.4,'EdgeColor','b','LineWidth',1.5);
+
+for s = 1:N_slots_ox
+    ang = (s-1)*2*pi/N_slots_ox;
+    xs = (r1-0.4)*cos(ang); ys = (r1-0.4)*sin(ang);
+    sw = d_ox_slot*1e3/2;
+    rectangle('Position',[xs-sw/2,ys-sw/2,sw,sw],'Curvature',0.5,...
+              'FaceColor',[.2 .5 .9],'EdgeColor','k','LineWidth',0.5);
+    quiver(xs,ys,-sin(ang)*1.5,cos(ang)*1.5,0,'b','MaxHeadSize',0.5);
+end
+text(0,0,sprintf('LOx core\n%.1f mm ID',D_post_ox_inner*1e3),...
+     'HorizontalAlignment','center','FontSize',8,'Color',[.1 .3 .7],'FontWeight','bold');
+text(0,r3+1.5,sprintf('CH_4 annulus  OD=%.1f mm',D_fuel_outer*1e3),...
+     'HorizontalAlignment','center','FontSize',8,'Color',[.7 .2 0]);
+plot(pitch/2*1e3*cos(theta),pitch/2*1e3*sin(theta),'k:','LineWidth',0.8);
+text(r3+0.5,-r3-0.5,sprintf('Pitch = %.1f mm',pitch*1e3),'FontSize',8);
+title(sprintf('Coaxial Swirl Element (%d LOx slots + CH_4 annulus)',N_slots_ox));
+xlim([-pitch/2*1e3-3, pitch/2*1e3+3]); ylim([-pitch/2*1e3-3, pitch/2*1e3+3]);
+
+%% =========================================================================
+%  SECTION 7: REGENERATIVE COOLING CHANNEL SIZING
+%  ─────────────────────────────────────────────────────────────────────────
+%
+%  PHYSICS OVERVIEW:
+%  Heat flows from the hot combustion gas, through a gas-side boundary
+%  layer, through the solid chamber wall, through a coolant-side boundary
+%  layer, into the coolant (here: the liquid methane fuel, used as
+%  regenerative coolant before injection — standard practice [R3 Ch.4]).
+%
+%  This is a three-resistance series circuit per unit area [R10; R3 §4-12]:
+%
+%    q = (Taw - Tc_in) / (1/hg + t_w/k_w + 1/hc)
+%
+%  where:
+%    Taw  = adiabatic wall (recovery) temperature of the hot gas [K]
+%    Tc_in= bulk coolant temperature [K]
+%    hg   = hot-gas-side convective heat transfer coefficient [W/m²K]
+%    t_w  = wall thickness [m],  k_w = wall thermal conductivity [W/mK]
+%    hc   = coolant-side convective heat transfer coefficient [W/m²K]
+%
+%  Because hg, Tw, and hc are coupled (hg depends on wall temp via the
+%  Bartz "sigma" correction), the wall temperature is solved iteratively.
+%
+%  ADDITIONAL REFERENCES for this section:
+%    [R10] Wikipedia — "Regenerative cooling (rocketry)" — Bartz equation
+%          form, heat flux range (0.8-80 MW/m²), boundary layer physics
+%          https://en.wikipedia.org/wiki/Regenerative_cooling_(rocketry)
+%    [R11] Pizzarelli, M. — "Regenerative Cooling of Liquid Rocket Engine
+%          Thrust Chambers" — channel AR trade-off, ASME/AIAA review
+%    [R12] NASA SP-125 (Huzel & Huang) — wall materials, GRCop alloys
+%    [R13] Ruan, B. & Meng, H. — "Supercritical Heat Transfer of
+%          Cryogenic-Propellant Methane in Rectangular Engine Cooling
+%          Channels" J. Thermophysics & Heat Transfer, 2012
+%
+% =========================================================================
+fprintf('\n=================================================================\n');
+fprintf('  REGENERATIVE COOLING CHANNEL SIZING\n');
+fprintf('=================================================================\n\n');
+
+%  ── Step 7.0: Additional inputs for cooling analysis ─────────────────────
+%
+%  Combustion gas transport properties at Tc (approximate — for precise
+%  values use NASA CEA transport property output) [R1 App.A; R10]:
+mu_gas  = 1.0e-4;     % gas viscosity [Pa·s]  (CH4/O2 products, ~3000-3500K)
+cp_gas  = 2200;       % gas specific heat [J/(kg·K)]
+Pr_gas  = 0.70;       % gas Prandtl number (typical 0.6-0.8 for comb. products)
+
+%  Coolant (liquid methane) properties — bulk values, ~111-150K range.
+%  NOTE: near the pseudo-critical point methane properties vary sharply;
+%  for high-fidelity work use NIST REFPROP and march property values
+%  along the channel length [R11; R13].
+cp_cool   = 3480;     % LCH4 specific heat [J/(kg·K)] (subcooled, ~120K)
+k_cool    = 0.17;     % LCH4 thermal conductivity [W/(m·K)]
+mu_cool   = 1.1e-4;   % LCH4 dynamic viscosity [Pa·s]
+Pr_cool   = cp_cool*mu_cool/k_cool;   % coolant Prandtl number (computed)
+T_cool_in = 120;       % coolant inlet temperature [K]
+
+%  Wall material — typical choices: copper-alloy (high k, low strength)
+%  or nickel-alloy / stainless (lower k, higher strength). Many modern
+%  AM engines (3D-printed) use Inconel or GRCop-42 [R12].
+k_wall    = 350;       % wall thermal conductivity [W/(m·K)]  (GRCop-42 ~ 300-370 W/mK)
+t_wall    = 0.7e-3;    % wall thickness [m]  (typical 0.5-1.5 mm at throat;
+%                          thinner wall reduces conduction resistance but
+%                          must still survive pressure + thermal stress —
+%                          a structural check is NOT performed by this
+%                          script and should be done separately [R12])
+
+%  Channel geometry (initial guess — refined below)
+%
+%  NOTE ON DEFAULTS: at high Pc (>100 bar), gas-side resistance (1/hg)
+%  dominates the heat path, so adding channels alone has diminishing
+%  returns — wall thickness and material matter more.  The values below
+%  are a reasonable STARTING point for a 200 bar CH4/O2 engine; expect
+%  to iterate N_channels, t_wall, and possibly add a thermal barrier
+%  coating if Tw exceeds the material limit (see Step 7.4 check).
+N_channels  = 120;      % number of parallel cooling channels around chamber
+%                          Sized higher than typical low-Pc engines (40-80)
+%                          because at 200 bar the heat flux is severe;
+%                          see Pizzarelli [R11] for channel-count trends
+%                          vs Pc across published engines.
+chan_AR     = 4.0;      % channel aspect ratio (height/width).  Higher AR
+%                          → more heat transfer area without raising
+%                          coolant velocity excessively [R11; R13]
+rib_width_frac = 0.25;  % fraction of channel pitch occupied by rib (fin)
+%                          between channels.  Typical 0.2-0.4 [R3 §4-13]
+
+%  ── Step 7.1: Recovery (adiabatic wall) temperature ──────────────────────
+%
+%  The hot gas does not reach the wall at the full stagnation temperature;
+%  viscous dissipation in the boundary layer recovers only a fraction.
+%  Recovery factor for turbulent flow: r ≈ Pr^(1/3) [R1 eq.8-26; R10]
+%
+%    Taw = Tc * [1 + r*(γ-1)/2*M²] / [1 + (γ-1)/2*M²]
+
+r_recovery = Pr_gas^(1/3);
+
+%  ── Step 7.2: Bartz equation for hot-gas-side h_g ─────────────────────────
+%
+%  Bartz correlation [R8 cite; R10; R1 eq.8-23]:
+%
+%   hg = (0.026/Dt^0.2) * (μ^0.2 cp / Pr^0.6) * (Pc/c*)^0.8 *
+%        (Dt/Rc)^0.1 * (At/A)^0.9 * σ
+%
+%   σ = [0.5*(Tw/Tc)*(1+(γ-1)/2*M²) + 0.5]^(-0.68) * [1+(γ-1)/2*M²]^(-0.12)
+%
+%  σ corrects for property variation across the boundary layer and
+%  depends on the (unknown) wall temperature Tw — hence the iteration.
+%  At the throat: A/At = 1, M = 1 — this is where heat flux is highest.
+%
+%  We evaluate at three stations: chamber (subsonic), throat (M=1), and
+%  the nozzle exit, to show how q varies axially.
+
+Rc_curv = 1.5 * (Dstar/2);   % throat wall radius of curvature ≈ 1.0-1.5×Rt [R1 §8]
+
+station_names = {'Chamber (M~0.2)','Throat (M=1)','Exit (eps=eps)'};
+station_M     = [0.2, 1.0, Me];
+station_AAt   = [Ac/Astar, 1.0, eps];
+
+fprintf('  Recovery factor r    = %.4f\n', r_recovery);
+fprintf('  Coolant Pr (LCH4)    = %.3f\n\n', Pr_cool);
+
+station_q  = zeros(1,3);
+station_hg = zeros(1,3);
+station_Tw = zeros(1,3);
+station_Tcw= zeros(1,3);
+station_hc = zeros(1,3);
+
+for s = 1:3
+    Ms   = station_M(s);
+    AAts = station_AAt(s);
+    Taw_s = Tc * (1 + r_recovery*(gamma-1)/2*Ms^2) / (1 + (gamma-1)/2*Ms^2);
+
+    %  Iterative solve for wall temperature at this station ───────────────
+    %  Energy balance: hg*(Taw-Tw) = k_w/t_w*(Tw-Tcw) = hc*(Tcw-Tc_in)
+    %  Solved by fixed-point iteration on Tw (gas-side wall temp).
+
+    Tw  = 700;   % initial guess [K]
+    for it = 1:60
+        sigma = (0.5*(Tw/Tc)*(1+(gamma-1)/2*Ms^2) + 0.5)^(-0.68) * ...
+                (1+(gamma-1)/2*Ms^2)^(-0.12);
+        hg = (0.026/Dstar^0.2) * (mu_gas^0.2*cp_gas/Pr_gas^0.6) * ...
+             (Pc/cstar_real)^0.8 * (Dstar/Rc_curv)^0.1 * (1/AAts)^0.9 * sigma;
+
+        %  Coolant-side h_c via Dittus-Boelter [R10; Dittus & Boelter 1930]:
+        %  Nu = 0.023*Re^0.8*Pr^0.4 (coolant being heated).
+        %  Representative hydraulic diameter used here; refined in Step 7.3.
+        Dh_guess = 0.003;
+        v_cool_guess = mdot_fuel / (rho_fuel * N_channels * Dh_guess^2 * chan_AR);
+        Re_cool = rho_fuel * v_cool_guess * Dh_guess / mu_cool;
+        Nu_cool = 0.023 * Re_cool^0.8 * Pr_cool^0.4;
+        hc = Nu_cool * k_cool / Dh_guess;
+
+        %  Solve series resistance for Tw and Tcw:
+        %    q = hg*(Taw-Tw) = (Tw-Tcw)*k_wall/t_wall = hc*(Tcw-T_cool_in)
+        Rg = 1/hg; Rw = t_wall/k_wall; Rc_ = 1/hc;
+        q  = (Taw_s - T_cool_in) / (Rg + Rw + Rc_);
+        Tw_new = Taw_s - q*Rg;
+        if abs(Tw_new - Tw) < 1e-3; Tw = Tw_new; break; end
+        Tw = Tw_new;
+    end
+    Tcw = Tw - q*Rw;
+
+    station_q(s)=q; station_hg(s)=hg; station_Tw(s)=Tw; station_Tcw(s)=Tcw; station_hc(s)=hc;
+
+    fprintf('  --- %s ---\n', station_names{s});
+    fprintf('    Adiabatic wall T (Taw) = %.1f K\n', Taw_s);
+    fprintf('    Hot-gas h_g            = %.1f W/m2K\n', hg);
+    fprintf('    Coolant-side h_c       = %.1f W/m2K\n', hc);
+    fprintf('    Heat flux q            = %.2f MW/m2\n', q/1e6);
+    fprintf('    Gas-side wall temp Tw  = %.1f K\n', Tw);
+    fprintf('    Coolant-side wall Tcw  = %.1f K\n\n', Tcw);
+end
+
+q_throat = station_q(2);
+
+fprintf('  Heat flux range check: %.1f MW/m2 (typical range: 0.8-80 MW/m2 [R10])\n', q_throat/1e6);
+if q_throat/1e6 < 0.8 || q_throat/1e6 > 80
+    fprintf('  *** WARNING: heat flux outside typical range — check inputs ***\n');
+end
+
+%  ── Step 7.3: Channel sizing at the throat (peak heat flux station) ──────
+%
+%  Design approach [R3 §4-13; MIT Wiki R-cool §5]:
+%    1. Choose N_channels to fit around chamber circumference at throat
+%    2. Each channel carries mdot_fuel / N_channels
+%    3. Pick aspect ratio (height/width) — higher AR increases heat
+%       transfer area & coolant velocity for fixed flow area, but raises
+%       pressure drop and is harder to manufacture [R11; R13]
+%    4. Check coolant velocity falls in the practical 10-40 m/s band
+
+circ_throat  = pi * Dstar;
+pitch_throat = circ_throat / N_channels;
+w_channel    = pitch_throat * (1 - rib_width_frac);
+h_channel    = chan_AR * w_channel;
+A_channel    = w_channel * h_channel;
+Dh_channel   = 4*A_channel / (2*(w_channel+h_channel));
+
+mdot_channel = mdot_fuel / N_channels;
+v_channel    = mdot_channel / (rho_fuel * A_channel);
+
+Re_channel = rho_fuel * v_channel * Dh_channel / mu_cool;
+Nu_channel = 0.023 * Re_channel^0.8 * Pr_cool^0.4;   % Dittus-Boelter, heating [R10]
+hc_channel = Nu_channel * k_cool / Dh_channel;
+
+fprintf('\n  --- Throat channel geometry (sized) ---\n');
+fprintf('  N channels             = %d\n', N_channels);
+fprintf('  Channel pitch           = %.2f mm\n', pitch_throat*1e3);
+fprintf('  Channel width            = %.2f mm\n', w_channel*1e3);
+fprintf('  Channel height           = %.2f mm  (AR=%.1f)\n', h_channel*1e3, chan_AR);
+fprintf('  Hydraulic diameter       = %.2f mm\n', Dh_channel*1e3);
+fprintf('  Coolant velocity         = %.2f m/s\n', v_channel);
+fprintf('  Re (coolant)             = %.2e\n', Re_channel);
+fprintf('  h_c (Dittus-Boelter)     = %.1f W/m2K\n', hc_channel);
+
+if v_channel < 5
+    fprintf('  *** NOTE: coolant velocity low — consider fewer/smaller channels ***\n');
+elseif v_channel > 50
+    fprintf('  *** NOTE: coolant velocity high — check pressure drop budget ***\n');
+end
+
+%  ── Step 7.4: Re-solve wall temperature with actual channel h_c ──────────
+Taw_throat = Tc * (1 + r_recovery*(gamma-1)/2*1^2) / (1 + (gamma-1)/2*1^2);
+Tw = 700;
+for it = 1:80
+    sigma = (0.5*(Tw/Tc)*(1+(gamma-1)/2*1^2) + 0.5)^(-0.68) * (1+(gamma-1)/2*1^2)^(-0.12);
+    hg = (0.026/Dstar^0.2) * (mu_gas^0.2*cp_gas/Pr_gas^0.6) * ...
+         (Pc/cstar_real)^0.8 * (Dstar/Rc_curv)^0.1 * 1^0.9 * sigma;
+    Rg = 1/hg; Rw = t_wall/k_wall; Rc_ = 1/hc_channel;
+    q_final = (Taw_throat - T_cool_in) / (Rg + Rw + Rc_);
+    Tw_new = Taw_throat - q_final*Rg;
+    if abs(Tw_new-Tw) < 1e-3; Tw = Tw_new; break; end
+    Tw = Tw_new;
+end
+Tcw_final = Tw - q_final*Rw;
+
+fprintf('\n  --- Final throat wall solution (using actual channel h_c) ---\n');
+fprintf('  Heat flux q             = %.2f MW/m2\n', q_final/1e6);
+fprintf('  Gas-side wall Tw        = %.1f K\n', Tw);
+fprintf('  Coolant-side wall Tcw   = %.1f K\n', Tcw_final);
+fprintf('  Wall delta-T (cond.)    = %.1f K\n', Tw-Tcw_final);
+
+%  Resistance breakdown — shows which resistance dominates the heat path.
+%  At high Pc the gas-side film (1/hg) typically dominates [R10; R11],
+%  meaning channel geometry changes alone have limited leverage; wall
+%  thickness/material and Pc/Tc have more.
+R_total = Rg + Rw + Rc_;
+fprintf('\n  --- Resistance breakdown (helps target the right fix) ---\n');
+fprintf('  Gas-side film  (1/hg)   = %5.1f%%\n', Rg/R_total*100);
+fprintf('  Wall conduction (t/k)   = %5.1f%%\n', Rw/R_total*100);
+fprintf('  Coolant film   (1/hc)   = %5.1f%%\n', Rc_/R_total*100);
+
+T_wall_limit = 850;   % typical Cu-alloy (GRCop-42) practical operating limit [R12]
+if Tw > T_wall_limit
+    fprintf('\n  *** WARNING: Tw=%.0fK exceeds typical Cu-alloy limit (%.0fK).\n', Tw, T_wall_limit);
+    if Rg/R_total > 0.45
+        fprintf('      The gas-side film resistance is %.0f%% of the total — it\n', Rg/R_total*100);
+        fprintf('      DOMINATES the heat path, so coolant-side changes (more\n');
+        fprintf('      channels, higher AR) give DIMINISHING RETURNS here.\n');
+        fprintf('      Higher-leverage options, roughly in order:\n');
+        fprintf('        1. Thinner wall t_wall (reduces conduction term directly)\n');
+        fprintf('        2. Lower Pc or Tc if mission allows (hg ~ Pc^0.8)\n');
+        fprintf('        3. Thermal barrier coating (adds a resistance gas-side)\n');
+        fprintf('        4. Supplemental film cooling near the throat [R3 §4; R10]\n');
+        fprintf('      Increasing N_channels/chan_AR further will help only modestly.\n');
+    else
+        fprintf('      Coolant-side resistance is significant here — try increasing\n');
+        fprintf('      N_channels or chan_AR to raise coolant velocity and h_c.\n');
+    end
+else
+    fprintf('  Wall temp check: OK (limit ~%.0f K for Cu-alloy liners)\n', T_wall_limit);
+end
+
+%  ── Step 7.5: Coolant pressure drop (Darcy-Weisbach) ──────────────────────
+%
+%  ΔP = f * (L/Dh) * (ρ*v²/2)                              [R3 §6-2; R11]
+%  Friction factor (smooth tube, Blasius): f ≈ 0.184*Re^-0.2 for Re > 1e4
+
+f_friction = 0.184 * Re_channel^(-0.2);
+Lconv_est  = (Dc/2 - Dstar/2) / tan(30*pi/180);   % convergent length estimate, 30° half-angle
+L_cooling  = Lc + Lconv_est;                       % cooled length: chamber + convergent
+
+dP_channel = f_friction * (L_cooling/Dh_channel) * (rho_fuel*v_channel^2/2);
+
+fprintf('\n  --- Coolant pressure drop (chamber + convergent section) ---\n');
+fprintf('  Friction factor f        = %.4f  (Blasius, smooth tube)\n', f_friction);
+fprintf('  Cooling path length      = %.1f mm\n', L_cooling*1e3);
+fprintf('  Pressure drop dP         = %.3f bar\n', dP_channel/1e5);
+fprintf('  vs injector dP budget    = %.2f bar  (coolant dP should be << injector dP)\n', dP_fuel/1e5);
+
+%  ── Step 7.6: Bulk coolant temperature rise ───────────────────────────────
+%
+%  Total heat absorbed — uses a representative average/peak heat flux
+%  ratio over the cooled length, since q(x) is highest at the throat and
+%  lower elsewhere [R3 §4; typical axial heat flux profile shape].
+%  For a precise value, integrate q(x) computed station-by-station.
+
+q_avg_factor = 0.40;
+A_wetted = pi * ((Dc+Dstar)/2) * L_cooling;
+Q_total  = q_throat * q_avg_factor * A_wetted;
+dT_coolant = Q_total / (mdot_fuel * cp_cool);
+
+fprintf('\n  --- Bulk coolant heating ---\n');
+fprintf('  Approx. wetted area      = %.4f m2\n', A_wetted);
+fprintf('  Total heat absorbed Q    = %.2f kW  (avg/peak factor %.2f)\n', Q_total/1e3, q_avg_factor);
+fprintf('  Coolant delta-T          = %.1f K\n', dT_coolant);
+fprintf('  Coolant outlet temp      = %.1f K  (inlet %.1f K)\n', T_cool_in+dT_coolant, T_cool_in);
+if T_cool_in + dT_coolant > 190
+    fprintf('  *** NOTE: outlet temp approaching methane critical region (~190K).\n');
+    fprintf('      Verify coolant remains supercritical/subcooled per feed pressure. ***\n');
+end
+
+%% =========================================================================
+%  SECTION 8: COOLING SUMMARY PLOTS
+% =========================================================================
+
+%  ── Plot 5: Heat flux & wall temperature along chamber axis ──────────────
+n_pts = 50;
+M_profile = [linspace(0.15,1,25), linspace(1,Me,25)];
+AAt_profile = zeros(1,n_pts);
+for k=1:25
+    AAt_profile(k) = Ac/Astar - (Ac/Astar-1)*(k-1)/24;
+end
+for k=26:n_pts
+    AAt_profile(k) = 1 + (eps-1)*((k-25)/25);
+end
+x_positions = linspace(0,1,n_pts);
+
+q_profile  = zeros(1,n_pts);
+Tw_profile = zeros(1,n_pts);
+for k = 1:n_pts
+    Mk = M_profile(k);
+    Taw_k = Tc*(1+r_recovery*(gamma-1)/2*Mk^2)/(1+(gamma-1)/2*Mk^2);
+    Twk = 700;
+    for it=1:50
+        sigk = (0.5*(Twk/Tc)*(1+(gamma-1)/2*Mk^2)+0.5)^(-0.68)*(1+(gamma-1)/2*Mk^2)^(-0.12);
+        hgk = (0.026/Dstar^0.2)*(mu_gas^0.2*cp_gas/Pr_gas^0.6)*(Pc/cstar_real)^0.8* ...
+              (Dstar/Rc_curv)^0.1*(1/AAt_profile(k))^0.9*sigk;
+        Rg=1/hgk; Rw=t_wall/k_wall; Rc2=1/hc_channel;
+        qk = (Taw_k-T_cool_in)/(Rg+Rw+Rc2);
+        Twk_new = Taw_k - qk*Rg;
+        if abs(Twk_new-Twk)<1e-3; Twk=Twk_new; break; end
+        Twk = Twk_new;
+    end
+    q_profile(k)=qk; Tw_profile(k)=Twk;
+end
+
+figure('Name','Heat Flux Profile','NumberTitle','off','Color','white');
+yyaxis left
+plot(x_positions, q_profile/1e6,'r-','LineWidth',2);
+ylabel('Heat flux q [MW/m^2]');
+yyaxis right
+plot(x_positions, Tw_profile,'b-','LineWidth',2);
+ylabel('Gas-side wall temp T_w [K]');
+xlabel('Normalized axial position (0=chamber entry, 0.5=throat, 1=exit)');
+title('Heat Flux & Wall Temperature Along Chamber Axis');
+xline(0.5,'k--','LineWidth',1);
+grid on;
+
+%  ── Plot 6: Channel cross-section schematic ──────────────────────────────
+figure('Name','Cooling Channel Cross-Section','NumberTitle','off','Color','white');
+hold on; axis equal;
+n_show = 4;
+for i = 1:n_show
+    x0 = (i-1)*pitch_throat*1e3;
+    rectangle('Position',[x0, 0, w_channel*1e3, h_channel*1e3], ...
+              'Curvature',0.15,'FaceColor',[0.7 0.85 1],'EdgeColor','b','LineWidth',1.2);
+    rib_x = x0 + w_channel*1e3;
+    rib_w = pitch_throat*1e3*rib_width_frac;
+    rectangle('Position',[rib_x, 0, rib_w, h_channel*1e3], ...
+              'FaceColor',[0.8 0.8 0.8],'EdgeColor',[0.4 0.4 0.4],'LineWidth',1);
+end
+plot([0, n_show*pitch_throat*1e3],[0 0],'r-','LineWidth',3);
+text(n_show*pitch_throat*1e3/2, -1.5, 'Hot gas side','Color','r','FontSize',9,'HorizontalAlignment','center');
+plot([0, n_show*pitch_throat*1e3],[h_channel*1e3 h_channel*1e3],'k-','LineWidth',2);
+text(n_show*pitch_throat*1e3/2, h_channel*1e3+1, 'Outer structural wall','FontSize',9,'HorizontalAlignment','center');
+xlabel('Circumferential position [mm]'); ylabel('Radial height [mm]');
+title(sprintf('Cooling Channel Cross-Section (w=%.2fmm, h=%.2fmm, AR=%.1f)', ...
+      w_channel*1e3, h_channel*1e3, chan_AR));
+axis equal; grid on;
+
+
+%% =========================================================================
+%  SECTION 9: HELPER FUNCTIONS
+% =========================================================================
+function AR = area_ratio(M, gam)
+    % Isentropic area ratio [R1 eq. 3-13]
+    e = (gam+1)/(2*(gam-1));
+    b = (2/(gam+1))*(1+(gam-1)/2*M^2);
+    AR = (1/M)*b^e;
+end
+
+function Me = solve_mach(eps_in, gam)
+    % Newton-Raphson for supersonic Mach from area ratio [R1 §3-4]
+    Me = 2.0;
+    for i = 1:300
+        f  = area_ratio(Me,gam) - eps_in;
+        df = (area_ratio(Me+1e-7,gam)-area_ratio(Me-1e-7,gam))/2e-7;
+        dM = f/df;  Me = max(Me-dM, 1.001);
+        if abs(dM) < 1e-11; break; end
+    end
+end
