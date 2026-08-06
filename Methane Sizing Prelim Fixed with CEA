@@ -1,0 +1,739 @@
+%% =========================================================================
+%  METHALOX ROCKET ENGINE & INJECTOR SIZING  —  Preliminary Design Tool
+%  =========================================================================
+%
+%  Covers:
+%    1. Nozzle / thrust chamber sizing  (isentropic 1-D analysis)
+%    2. Injector sizing                 (orifice CdA method, coaxial-swirl)
+%    3. Results summary table + plots
+%
+%  KEY REFERENCES (cited inline as [R#]):
+%    [R1] Sutton, G.P. & Biblarz, O. — "Rocket Propulsion Elements" 9th ed.
+%         Wiley, 2017.  ISBN 978-1-118-75388-0
+%    [R2] NASA Glenn Research Center — "Rocket Thrust Equations"
+%         https://www.grc.nasa.gov/www/k-12/airplane/rktthsum.html
+%    [R3] Huzel, D.K. & Huang, D.H. — "Modern Engineering for Design of
+%         Liquid-Propellant Rocket Engines" AIAA, 1992. ISBN 1-56347-013-6
+%    [R4] NASA NTRS 20100033271 — "A Historical Systems Study of Liquid
+%         Rocket Engine Throttling Capabilities", Betts & Frederick, 2010.
+%         https://ntrs.nasa.gov/citations/20100033271
+%    [R5] NASA NTRS 20190001326 — "Mass Flow Rate and Isolation
+%         Characteristics of Injectors for Propellants under Choked and
+%         Unchoked Conditions", 2019.
+%         https://ntrs.nasa.gov/citations/20190001326
+%    [R6] MIT Rocket Team Wiki — "Injector Design Guide", 2020.
+%         https://wikis.mit.edu/confluence/display/RocketTeam/
+%    [R7] Krzycki, L.J. — "How to Design, Build and Test Small Liquid-Fuel
+%         Rocket Engines", Rocketlab, 1967 (hosted: spacha.github.io)
+%    [R8] Yang, V. et al. — "Liquid Rocket Engine Combustion Instability"
+%         AIAA Progress Series Vol. 169, 1995.
+%    [R9] Bazarov, V.G. — "Liquid-Propellant Rocket Engine Injector Design"
+%         (as cited in: Sharma et al., Int. J. Fluid Mech. Res., 2025)
+%
+%  ASSUMPTIONS / LIMITATIONS:
+%    - Ideal gas, frozen composition through nozzle (1-D isentropic)
+%    - Liquid propellants (LOx + liquid CH4) treated as incompressible
+%      through injector orifices (Bernoulli / Torricelli model)
+%    - Combustion efficiency η_c* and nozzle efficiency η_CF applied as
+%      scalar multipliers — not computed from first principles
+%    - For high-fidelity thermochemistry: use NASA CEA or RPA software
+%
+%  HOW TO USE:
+%    Edit the INPUT PARAMETERS section, then run.  All results print to
+%    the Command Window and four figure windows are generated.
+%
+%
+%
+%  FIX 1 (CRITICAL — imaginary numbers):
+%    Original back-calculated A* using F_vac with (Pe-Pa)*eps included.
+%    At eps=40, sea-level Pa makes (Pe-Pa) large & negative -> negative/
+%    complex A*. FIX: size A* from vacuum thrust alone (Pa=0 in that
+%    equation), then report actual sea-level thrust F_alt separately.
+%
+%  FIX 2 (CEA-derived thermochemistry):
+%    Tc, gamma, Mw_g replaced with actual CEA output (comb end column,
+%    O/F=3.6, Pc=20.353 bar) instead of placeholder literature values.
+%    Pc updated to match the pressure CEA's thermochemistry corresponds
+%    to (20.353 bar comb-end, vs. the round 20 bar injector-face target).
+%
+% =========================================================================
+clear; clc; close all;
+
+%% =========================================================================
+%  SECTION 0: PHYSICAL CONSTANTS
+% =========================================================================
+g0   = 9.80665;        % Standard gravity [m/s²]
+Ru   = 8314.46;        % Universal gas constant [J/(kmol·K)]
+
+
+%% =========================================================================
+%  SECTION 1: INPUT PARAMETERS
+%  =========================================================================
+%  ── Mission targets ──────────────────────────────────────────────────────
+F_vac   = 20e3;        % Vacuum thrust [N]  — e.g. 20 kN like LEAP71 test
+Pc      = 20.353e5;    % Chamber pressure [Pa]  — CEA COMB END pressure at
+%                        O/F=3.6, Pinj=20 bar w/ finite-area-combustor loss
+%                        (was 2e6 Pa / 20 bar exactly — updated to match
+%                        the pressure the CEA thermochemistry below was
+%                        actually evaluated at)
+eps     = 40;          % Nozzle expansion ratio  Ae/A*  (dimensionless)
+OF      = 3.6;         % Oxidiser-to-fuel mass ratio (by mass)
+%                        Stoichiometric O/F for CH4/O2 ≈ 4.0; fuel-rich
+%                        at 3.5–3.8 reduces Tc and protects hardware [R1 §5]
+Pa      = 101325;      % Ambient pressure [Pa]  (0 = vacuum; 101325 = SL)
+%                        NOTE: no longer feeds directly into the A* sizing
+%                        equation (see FIX 1) — used only to report actual
+%                        sea-level thrust F_alt and flag over-expansion.
+
+%  ── Propellant thermochemistry (CH4 / LOx at O/F = 3.6) ─────────────────
+%  Pulled from NASA CEA, COMB END column, O/F=3.6, Pinj=20 bar (fac mode).
+%  Injector-column values are pre-combustion reactant state — not used.
+%  Throat-column values are NOT used here either: this script's own
+%  isentropic relations re-derive the throat/exit state from comb-end
+%  conditions, so plugging in CEA's throat state would double-expand it.
+Tc      = 3395.50;     % Adiabatic (comb end) flame temperature [K]
+gamma   = 1.1234;      % Isentropic γs, comb end (CEA "GAMMAs")
+Mw_g   = 21.836e-3;   % Mean molecular weight of products [kg/mol]  (M=21.836)
+
+%  ── Combustion chamber geometry ──────────────────────────────────────────
+Lstar   = 1.2;         % Characteristic length L* [m]
+%                        L* = 0.5–1.5 m typical for CH4/O2 [R1 §8-3; R3]
+%                        Controls residence time for complete combustion
+Cc      = 5.0;         % Contraction ratio Ac/A*
+
+%  ── Efficiencies ─────────────────────────────────────────────────────────
+eta_cstar = 0.96;      % c* efficiency (accounts for incomplete combustion,
+%                        mixing losses).  Typical range: 0.94–0.99 [R1 §3]
+eta_CF   = 0.98;       % CF efficiency (divergence angle, boundary layer,
+%                        friction).  Typical range: 0.96–0.99 [R1 §3]
+
+%  ── Injector design parameters ───────────────────────────────────────────
+dPinj_frac = 0.20;     % Injector ΔP as fraction of Pc
+%                        Historical rule of thumb: 15–20% of Pc [R4; R6]
+%                        Provides "stiffness" to isolate chamber acoustics
+%                        from feed system and prevent combustion instability
+%                        [R8]. Lower values risk flow dribble & chugging.
+
+Cd_ox    = 0.70;       % Discharge coeff — oxidiser (LOx) orifices
+Cd_fuel  = 0.70;       % Discharge coeff — fuel (CH4) orifices
+%                        Cd depends on L/D of orifice, inlet geometry, Re.
+%                        Sharp-edged: ~0.61; well-rounded: ~0.80 [R1 §9; R7]
+%                        Typical range 0.6–0.82.  Verified by cold-flow test.
+
+N_elements = 19;       % Number of injector elements (odd for hex packing)
+%                        One centre + 6+12 for 3-ring hex pattern = 19
+%                        Each element carries 1/N of total mass flow.
+
+rho_ox   = 1141;       % LOx density [kg/m³] at ~90 K, 1 atm  [R1 App. A]
+rho_fuel = 424;        % LCH4 density [kg/m³] at ~111 K, 1 atm [R1 App. A]
+
+%  ── Coaxial-swirl element geometry (optional, for reference) ─────────────
+%  For swirl injectors, the key non-dimensional parameter is the swirl
+%  number A (geometric swirl parameter) defined by Bazarov [R9]:
+%    A = R_vc / (n_t * r_t)
+%  where R_vc = vortex chamber radius, n_t = number of tangential inlets,
+%  r_t = radius of tangential inlet.  A ≈ 2–4 is typical for LOx elements.
+%  We compute element-level geometry below as indicative sizing only.
+
+
+%% =========================================================================
+%  SECTION 2: DERIVED CONSTANTS
+% =========================================================================
+R = Ru / (Mw_g * 1000);   % Specific gas constant [J/(kg·K)]
+%                            R = Ru / M  where M in [g/mol] → [kg/mol]
+
+
+%% =========================================================================
+%  SECTION 3: NOZZLE / THRUST CHAMBER SIZING
+%  ─────────────────────────────────────────────────────────────────────────
+%  Reference: NASA GRC [R2]; Sutton §3 [R1]; Huzel §4 [R3]
+% =========================================================================
+
+fprintf('=================================================================\n');
+fprintf('  METHALOX ENGINE SIZING — Thrust Chamber\n');
+fprintf('=================================================================\n\n');
+
+%  ── Step 3.1: Exit Mach number from area ratio ───────────────────────────
+%
+%  The isentropic area-ratio relation [R1 eq. 3-13; R2]:
+%
+%    Ae/A* = (1/Me) * [(2/(γ+1)) * (1 + (γ-1)/2 * Me²)]^[(γ+1)/(2(γ-1))]
+%
+%  This is transcendental in Me — solved by Newton-Raphson iteration.
+%  We want the supersonic root (Me > 1).
+
+Me = 2.0;   % initial guess in supersonic regime
+for iter = 1:300
+    AR   = area_ratio(Me, gamma);
+    dAR  = (area_ratio(Me+1e-7, gamma) - area_ratio(Me-1e-7, gamma)) / 2e-7;
+    step = (AR - eps) / dAR;
+    Me   = Me - step;
+    Me   = max(Me, 1.001);   % enforce supersonic branch
+    if abs(step) < 1e-11; break; end
+end
+fprintf('  Exit Mach Me        = %.4f\n', Me);
+
+%  ── Step 3.2: Isentropic exit conditions ─────────────────────────────────
+%
+%  Isentropic pressure and temperature ratios [R1 eq. 3-14, 3-15]:
+%    Pe/Pc = [1 + (γ-1)/2 * Me²]^(-γ/(γ-1))
+%    Te/Tc = [1 + (γ-1)/2 * Me²]^(-1)
+
+Pe = Pc * (1 + (gamma-1)/2 * Me^2)^(-gamma/(gamma-1));   % [Pa]
+Te = Tc * (1 + (gamma-1)/2 * Me^2)^(-1);                  % [K]
+
+%  Exit velocity from speed of sound and Mach number [R2]:
+%    Ve = Me * sqrt(γ * R * Te)
+Ve = Me * sqrt(gamma * R * Te);   % [m/s]
+fprintf('  Exit pressure Pe    = %.4f bar\n', Pe/1e5);
+fprintf('  Exit temperature Te = %.1f K\n', Te);
+fprintf('  Exit velocity Ve    = %.1f m/s\n', Ve);
+
+%  ── Step 3.3: Throat flow per unit area (choked condition) ───────────────
+%
+%  At the throat (M=1), mass flow is choked [R1 eq. 3-24; R2]:
+%    ṁ/A* = Pc * Γ / sqrt(R * Tc)
+%  where Γ (capital Gamma, Vandenkerckhove function) is:
+%    Γ = sqrt(γ) * (2/(γ+1))^[(γ+1)/(2(γ-1))]
+
+Gamma_vdk = sqrt(gamma) * (2/(gamma+1))^((gamma+1)/(2*(gamma-1)));
+mdot_per_Astar = Pc * Gamma_vdk / sqrt(R * Tc);   % [kg/(s·m²)]
+
+%  ── Step 3.4: Throat area from ideal thrust equation ─────────────────────
+%
+%  Thrust equation [R1 eq. 2-13; R2]:
+%    F = ṁ*Ve + (Pe - Pa)*Ae        where  Ae = eps * A*
+%
+%  FIX 1: A* must be sized from the VACUUM thrust equation alone (Pa=0
+%  in THIS equation) — F_vac is a vacuum target, so mixing in ambient Pa
+%  here is physically inconsistent. At eps=40, sea-level Pa makes the
+%  nozzle heavily overexpanded (Pe << Pa); the old code's (Pe-Pa)*eps term
+%  went strongly negative and could flip A* negative -> complex/imaginary
+%  results downstream (Dstar, Ae, Ac, etc. all take sqrt(Astar)).
+%
+%    A*  = F_vac / [(ṁ/A*)*Ve + Pe*eps]              (Pa = 0, vacuum)
+%
+%  Apply efficiency: actual A* is larger by 1/(η_c* * η_CF) effectively —
+%  we apply efficiencies via cstar and CF below.
+
+Astar_ideal = F_vac / (mdot_per_Astar * Ve + Pe * eps);  % [m²]  (Pa=0)
+
+%  Apply c* efficiency: real Tc_eff = Tc * η_c*² (lower flame temp due to
+%  incomplete combustion).  Equivalent: Astar increases by 1/η_c*.
+%  Apply CF efficiency: real CF = CF_ideal * η_CF (divergence, BL losses).
+%  Combined: Astar_real = Astar_ideal / (η_c* * η_CF)  [R1 §3-4; R3 §4-2]
+Astar = Astar_ideal / (eta_cstar * eta_CF);   % [m²]
+
+mdot = mdot_per_Astar * Astar;                % total mass flow [kg/s]
+
+%  ── Step 3.5: Performance metrics ────────────────────────────────────────
+%
+%  Characteristic velocity c* [R1 eq. 2-17]:
+%    c* = Pc * A* / ṁ  =  sqrt(R*Tc/γ) / Γ
+%  This is a measure of combustion efficiency (independent of nozzle shape).
+
+cstar_ideal = Pc * Astar / mdot;              % [m/s]
+cstar_real  = cstar_ideal * eta_cstar;        % effective c* [m/s]
+
+%  Thrust coefficient CF [R1 eq. 3-30]:
+%    CF = F / (Pc * A*)
+CF_ideal = F_vac / (Pc * Astar);
+CF_real  = CF_ideal * eta_CF;
+
+%  Specific impulse Isp [R1 eq. 2-5]:
+%    Isp = F / (ṁ * g0)
+%  Units: seconds — mass-specific impulse (propellant-independent measure)
+Isp_vac = F_vac / (mdot * g0);               % [s]
+
+%  ── Step 3.5b (NEW): Actual thrust at ambient Pa (FIX 1, cont.) ──────────
+%
+%  Now that A* is sized correctly from vacuum conditions, compute the
+%  ACTUAL thrust delivered at the specified ambient pressure as a
+%  separate output — this is where Pa belongs, not in the A* sizing step.
+%
+%    F_alt = ṁ*Ve + (Pe - Pa)*Ae                      [R1 eq. 2-13]
+
+Ae_real  = eps * Astar;                       % real (efficiency-applied) exit area [m²]
+F_alt    = mdot*Ve*eta_CF + (Pe - Pa)*Ae_real; % [N]  (Ve term scaled by η_CF like CF_real)
+Isp_alt  = F_alt / (mdot * g0);               % [s]
+
+fprintf('\n  --- Vacuum vs. Ambient (Pa=%.0f Pa) performance ---\n', Pa);
+fprintf('  Thrust (vacuum, target) = %.1f N\n', F_vac);
+fprintf('  Thrust (at Pa)          = %.1f N\n', F_alt);
+fprintf('  Isp (at Pa)             = %.1f s\n', Isp_alt);
+
+%  Overexpansion / underexpansion check [added — see script3 FIX 2]
+if Pa > 0
+    pe_pa = Pe / Pa;
+    if pe_pa < 0.30
+        fprintf('\n  *** OVEREXPANSION WARNING ***\n');
+        fprintf('  Pe/Pa = %.4f — nozzle is %.1fx overexpanded at Pa=%.0f Pa.\n', ...
+                pe_pa, 1/pe_pa, Pa);
+        fprintf('  For sea-level operation consider eps < %.0f to match Pe~Pa.\n', ...
+                eps * (Pa/Pe)^0.5);
+        fprintf('  F_vac is still a valid vacuum design target; F_alt above\n');
+        fprintf('  shows the (much lower, or negative) actual SL thrust.\n');
+    elseif pe_pa > 3.0
+        fprintf('\n  *** UNDEREXPANSION WARNING ***\n');
+        fprintf('  Pe/Pa = %.4f — nozzle is underexpanded; larger eps would\n', pe_pa);
+        fprintf('  recover more performance at this ambient pressure.\n');
+    end
+end
+
+%  ── Step 3.6: Nozzle and chamber geometry ────────────────────────────────
+Ae    = eps   * Astar;                        % exit area [m²]
+Ac    = Cc    * Astar;                        % chamber area [m²]
+Dstar = 2*sqrt(Astar/pi);                     % throat diameter [m]
+De    = 2*sqrt(Ae/pi);                        % exit diameter [m]
+Dc    = 2*sqrt(Ac/pi);                        % chamber diameter [m]
+
+%  Chamber volume via L* method [R1 §8-3; R3 §4-3]:
+%    Vc = L* * A*
+%  L* is an empirically-determined stay time parameter.  For CH4/O2,
+%  L* ≈ 0.5–1.5 m ensures complete combustion before nozzle entrance.
+Vc = Lstar * Astar;                           % chamber volume [m³]
+Lc = Vc / Ac;                                 % chamber cylindrical length [m]
+
+%  Propellant mass flow split
+mdot_ox   = mdot * OF / (1 + OF);            % [kg/s]
+mdot_fuel = mdot            / (1 + OF);       % [kg/s]
+
+%  ── Print thrust chamber results ─────────────────────────────────────────
+fprintf('\n  --- Performance ---\n');
+fprintf('  Isp (vacuum)        = %.1f s\n',    Isp_vac);
+fprintf('  c* (ideal/real)     = %.1f / %.1f m/s\n', cstar_ideal, cstar_real);
+fprintf('  CF (ideal/real)     = %.4f / %.4f\n', CF_ideal, CF_real);
+fprintf('  Total mass flow     = %.4f kg/s\n', mdot);
+fprintf('  Oxidiser flow       = %.4f kg/s\n', mdot_ox);
+fprintf('  Fuel flow           = %.4f kg/s\n', mdot_fuel);
+
+fprintf('\n  --- Nozzle Geometry ---\n');
+fprintf('  Throat area  A*     = %.4f cm²\n',  Astar*1e4);
+fprintf('  Throat diam  d*     = %.2f mm\n',   Dstar*1e3);
+fprintf('  Exit area    Ae     = %.2f cm²\n',  Ae*1e4);
+fprintf('  Exit diam    De     = %.2f mm\n',   De*1e3);
+
+fprintf('\n  --- Chamber Geometry (L* method) ---\n');
+fprintf('  Chamber vol  Vc     = %.3f L\n',    Vc*1e3);
+fprintf('  Chamber diam Dc     = %.2f mm\n',   Dc*1e3);
+fprintf('  Chamber len  Lc     = %.2f mm\n',   Lc*1e3);
+fprintf('  Contraction ratio   = %.1f\n',      Cc);
+
+
+%% =========================================================================
+%  SECTION 4: INJECTOR SIZING — ORIFICE CdA METHOD
+%  ─────────────────────────────────────────────────────────────────────────
+%
+%  PHYSICS OVERVIEW:
+%  The injector controls propellant flow into the chamber by metering each
+%  fluid through precision orifices.  Two constraints govern sizing:
+%
+%    (a) Each orifice must pass the correct mass flow at the design pressure
+%        drop — this sets orifice area.
+%    (b) The pressure drop must be large enough (≥15% Pc) to "stiffen" the
+%        injector: decouple the feed system from chamber acoustics and
+%        prevent combustion instability [R4; R8].
+%
+%  ORIFICE FLOW EQUATION (Torricelli / Bernoulli for incompressible liquid):
+%
+%    ṁ = Cd * A_orif * sqrt(2 * ρ * ΔP)            ... [R1 eq. 9-2; R5; R7]
+%
+%  Solving for orifice area A_orif:
+%
+%    A_orif = ṁ / (Cd * sqrt(2 * ρ * ΔP))
+%
+%  For a coaxial element, oxidiser and fuel orifice areas are sized
+%  independently to maintain the correct O/F in each element.
+%
+%  IMPORTANT NOTES on Cd:
+%    - Sharp-edged orifice (L/D < 0.5):  Cd ≈ 0.61 (vena contracta effect)
+%    - Short cylindrical (L/D = 2–5):    Cd ≈ 0.70–0.78 [R1 §9; R7]
+%    - Well-rounded inlet (L/D > 5):     Cd ≈ 0.80–0.82
+%    - Verify with cold-flow test using water or GN2 [R12; AIAA 2024-2776]
+%
+%  COAXIAL SWIRL ELEMENTS (preferred for LOx/GCH4):
+%    Liquid LOx enters through swirl slots tangentially into a vortex
+%    chamber, exits as a hollow cone.  Gaseous CH4 co-flows coaxially
+%    around the LOx cone.  Shear atomisation + centrifugal breakup gives
+%    fine droplets. [R9; DLR Bee 2023; NASA MSFC swirl coaxial tests]
+%    Used on: Raptor, Vulcain 2, RD-0120, Vinci.
+%
+% =========================================================================
+
+fprintf('\n=================================================================\n');
+fprintf('  INJECTOR SIZING\n');
+fprintf('=================================================================\n\n');
+
+%  ── Step 4.1: Pressure drops ─────────────────────────────────────────────
+%
+%  Design rule: ΔP_inj / Pc ≈ 15–20%  [R4; R6; MIT Rocket Team Wiki]
+%  This "stiffness ratio" ensures the injector impedance dominates over
+%  chamber pressure oscillations, preventing feed-coupled instability.
+%  Raptor runs ~20%, many SSME-derived designs use 15–25%.
+
+dP_ox   = dPinj_frac * Pc;    % oxidiser-side pressure drop [Pa]
+dP_fuel = dPinj_frac * Pc;    % fuel-side pressure drop [Pa]
+%  Note: It is common to use the same ΔP fraction for both sides, though
+%  some designs use different fractions to tune individual feed pressures.
+
+fprintf('  Pressure drop (ox)  = %.2f bar  (%.0f%% of Pc)\n', dP_ox/1e5, dPinj_frac*100);
+fprintf('  Pressure drop (fuel)= %.2f bar  (%.0f%% of Pc)\n', dP_fuel/1e5, dPinj_frac*100);
+
+%  Manifold inlet pressure required:
+P_feed_ox   = Pc + dP_ox;     % [Pa]
+P_feed_fuel = Pc + dP_fuel;   % [Pa]
+fprintf('  Required feed P(ox) = %.2f bar\n', P_feed_ox/1e5);
+fprintf('  Required feed P(fuel)= %.2f bar\n', P_feed_fuel/1e5);
+
+%  ── Step 4.2: Per-element mass flow ──────────────────────────────────────
+%
+%  Each element is identical and carries 1/N_elements of total flow.
+%  This uniform distribution assumption requires tight manufacturing
+%  tolerances (±1–2% orifice diameter per Huzel §6 [R3]).
+
+mdot_ox_elem   = mdot_ox   / N_elements;  % [kg/s] per element
+mdot_fuel_elem = mdot_fuel / N_elements;  % [kg/s] per element
+
+fprintf('\n  Elements:           = %d\n', N_elements);
+fprintf('  ṁ ox per element   = %.5f kg/s\n', mdot_ox_elem);
+fprintf('  ṁ fuel per element = %.5f kg/s\n', mdot_fuel_elem);
+
+%  ── Step 4.3: Total orifice area per element ─────────────────────────────
+%
+%  From orifice equation solved for area [R1 eq. 9-2; R5 eq. 2]:
+%    A = ṁ_elem / (Cd * sqrt(2 * ρ * ΔP))
+%
+%  This gives the TOTAL orifice area for that propellant per element.
+%  If an element has n_slots tangential inlets (for swirl), the area is
+%  divided equally among them: A_slot = A_total / n_slots.
+
+A_ox_total   = mdot_ox_elem   / (Cd_ox   * sqrt(2 * rho_ox   * dP_ox));
+A_fuel_total = mdot_fuel_elem / (Cd_fuel * sqrt(2 * rho_fuel * dP_fuel));
+
+%  Equivalent single-orifice diameters (for sizing check):
+d_ox_equiv   = 2*sqrt(A_ox_total / pi);     % [m]
+d_fuel_equiv = 2*sqrt(A_fuel_total / pi);   % [m]
+
+fprintf('\n  --- Per-element orifice areas (single-hole equivalent) ---\n');
+fprintf('  Ox total area        = %.4f mm²  (d_eq = %.3f mm)\n', A_ox_total*1e6, d_ox_equiv*1e3);
+fprintf('  Fuel total area      = %.4f mm²  (d_eq = %.3f mm)\n', A_fuel_total*1e6, d_fuel_equiv*1e3);
+
+%  ── Step 4.4: Multi-slot swirl injector layout ───────────────────────────
+%
+%  For a liquid-centred swirl coaxial (LCSCI) element [R9; DLR 2023]:
+%    - LOx enters via N_slots tangential inlet slots
+%    - Typical N_slots = 2, 3, or 4 (odd numbers avoided for balance)
+%    - Slot L/D ≥ 5 recommended [R13 — EDGE RIT guidelines] for flow
+%      reattachment and stable swirl
+%
+%  Swirl parameter A_swirl (Bazarov) [R9]:
+%    A_swirl = R_vc / (n_t * r_t)
+%  where R_vc = vortex chamber inner radius, r_t = tangential inlet radius.
+%  A_swirl ≈ 2–4 gives good spray cone angle (70–120°) [R9; Bee 2023].
+
+N_slots_ox = 4;          % number of tangential LOx inlet slots per element
+N_slots_fuel = 1;        % fuel is typically a single coaxial annulus
+
+A_ox_slot   = A_ox_total   / N_slots_ox;   % area per slot [m²]
+A_fuel_ann  = A_fuel_total / N_slots_fuel; % annular area (single annulus)
+
+d_ox_slot   = 2*sqrt(A_ox_slot / pi);     % diameter of circular slot equiv.
+%  For rectangular slots: w = A_slot / L_slot (choose L/D target)
+
+%  LOx post inner diameter (vortex chamber exit = LOx post ID)
+%  Typically: D_post_ox = 1.5–2.0 × d_ox_equiv (allows good swirl chamber)
+D_post_ox_inner = 2.0 * d_ox_equiv;          % LOx post inner diameter [m]
+D_post_ox_outer = 1.2 * D_post_ox_inner;     % LOx post outer wall thickness
+%  (wall thickness ≈ 0.5–1.0 mm for small engines; scaled here)
+
+%  Fuel annulus outer diameter:
+%  A_annulus = π/4 * (D_fuel_outer² - D_fuel_inner²)
+%  D_fuel_inner = D_post_ox_outer (fuel flows around LOx post)
+D_fuel_inner = D_post_ox_outer;
+D_fuel_outer = sqrt(D_fuel_inner^2 + 4*A_fuel_ann/pi);
+
+%  Element pitch (centre-to-centre spacing):
+%  Rule of thumb: pitch ≈ 8–15 × d* (throat diameter) / sqrt(N_elements)
+%  More practically: pack elements into chamber area Ac.
+%  For hexagonal close packing, pitch = sqrt(Ac / (N_elements * pi/4 * f_pack))
+f_pack   = 0.785;      % hex packing factor ≈ 0.785 (π√3/6 ≈ 0.9069 for ideal)
+%  Use 0.785 (square packing lower bound) — conservative.
+pitch    = sqrt(Ac / (N_elements * pi/4));  % element pitch [m]
+
+%  Injector face utilisation (D_fuel_outer should be ≤ pitch)
+fprintf('\n  --- Swirl-coaxial element sizing ---\n');
+fprintf('  N_slots (LOx swirl) = %d\n',    N_slots_ox);
+fprintf('  Area per LOx slot   = %.4f mm²  (d_eq = %.3f mm)\n', A_ox_slot*1e6, d_ox_slot*1e3);
+fprintf('  LOx post ID / OD    = %.2f / %.2f mm\n', D_post_ox_inner*1e3, D_post_ox_outer*1e3);
+fprintf('  Fuel annulus ID/OD  = %.2f / %.2f mm\n', D_fuel_inner*1e3, D_fuel_outer*1e3);
+fprintf('  Element pitch       = %.2f mm\n', pitch*1e3);
+
+if D_fuel_outer > pitch
+    fprintf('  *** WARNING: element OD (%.2f mm) > pitch (%.2f mm). ', D_fuel_outer*1e3, pitch*1e3);
+    fprintf('Increase N_elements or reduce orifice area. ***\n');
+else
+    fprintf('  Packing check: element OD %.2f mm < pitch %.2f mm  [OK]\n', D_fuel_outer*1e3, pitch*1e3);
+end
+
+%  ── Step 4.5: Injection velocities ───────────────────────────────────────
+%
+%  From the orifice equation: ṁ = Cd * A * ρ * v_inj  →  v = ṁ/(Cd*A*ρ)
+%  Or equivalently from Bernoulli: v = Cd * sqrt(2 * ΔP / ρ)
+%
+%  Rule of thumb injection velocities [R7; R11]:
+%    Liquids: 15–60 m/s preferred (ensures jet momentum for breakup)
+%    Lower than ~10 m/s → poor atomisation; higher → structural loads
+
+v_ox_inj   = Cd_ox   * sqrt(2 * dP_ox   / rho_ox);    % [m/s]
+v_fuel_inj = Cd_fuel * sqrt(2 * dP_fuel / rho_fuel);  % [m/s]
+
+fprintf('\n  --- Injection velocities ---\n');
+fprintf('  LOx  injection vel  = %.2f m/s\n', v_ox_inj);
+fprintf('  CH4  injection vel  = %.2f m/s\n', v_fuel_inj);
+
+%  Momentum ratio (important for coaxial element mixing efficiency)
+%  J = (ρ_gas * v_gas²) / (ρ_liq * v_liq²)
+%  For LCSCI, target J ≈ 5–20 for good atomisation [Bee 2023; Yang R8]
+J_mom = (rho_fuel * v_fuel_inj^2) / (rho_ox * v_ox_inj^2);
+fprintf('  Momentum ratio J    = %.3f  (target 5–20 for LCSCI)\n', J_mom);
+if J_mom < 2
+    fprintf('  *** NOTE: J < 2 — consider higher ΔP on fuel side or fewer fuel slots ***\n');
+end
+
+%  ── Step 4.6: Injector-level Reynolds number check ───────────────────────
+%
+%  High Re ensures turbulent orifice flow and stable Cd [R5]:
+%    Re = ρ * v * d / μ
+%  For LOx: μ ≈ 1.95×10⁻⁴ Pa·s; LCH4: μ ≈ 1.1×10⁻⁴ Pa·s [R1 App. A]
+%  EDGE guideline: Re ≥ 10^5 recommended [R13].
+
+mu_ox   = 1.95e-4;   % dynamic viscosity LOx [Pa·s]
+mu_fuel = 1.1e-4;    % dynamic viscosity LCH4 [Pa·s]
+Re_ox   = rho_ox   * v_ox_inj   * d_ox_slot   / mu_ox;
+Re_fuel = rho_fuel * v_fuel_inj * d_fuel_equiv / mu_fuel;
+
+fprintf('\n  --- Reynolds numbers ---\n');
+fprintf('  Re (LOx slot)       = %.2e  (guideline: ≥1e5)\n', Re_ox);
+fprintf('  Re (CH4 annulus)    = %.2e  (guideline: ≥1e5)\n', Re_fuel);
+if Re_ox < 1e5
+    fprintf('  *** WARNING: LOx Re < 1e5 — Cd may be unstable. Review orifice size. ***\n');
+end
+
+
+%% =========================================================================
+%  SECTION 5: DESIGN SUMMARY TABLE
+% =========================================================================
+
+fprintf('\n=================================================================\n');
+fprintf('  DESIGN SUMMARY\n');
+fprintf('=================================================================\n');
+fprintf('  %-28s %12s\n', 'Parameter', 'Value');
+fprintf('  %s\n', repmat('-', 1, 42));
+fprintf('  %-28s %12.1f  N\n',    'Thrust (vacuum)',      F_vac);
+fprintf('  %-28s %12.1f  bar\n',  'Chamber pressure',     Pc/1e5);
+fprintf('  %-28s %12.0f\n',       'Expansion ratio ε',    eps);
+fprintf('  %-28s %12.2f\n',       'O/F ratio',            OF);
+fprintf('  %-28s %12.1f  s\n',    'Isp (vacuum)',         Isp_vac);
+fprintf('  %-28s %12.1f  m/s\n',  'c* (effective)',       cstar_real);
+fprintf('  %-28s %12.4f  m²\n',   'Throat area A*',       Astar);
+fprintf('  %-28s %12.2f  mm\n',   'Throat diameter d*',   Dstar*1e3);
+fprintf('  %-28s %12.2f  mm\n',   'Exit diameter De',     De*1e3);
+fprintf('  %-28s %12.2f  mm\n',   'Chamber diameter Dc',  Dc*1e3);
+fprintf('  %-28s %12.2f  mm\n',   'Chamber length Lc',    Lc*1e3);
+fprintf('  %-28s %12.4f  kg/s\n', 'Total mass flow ṁ',    mdot);
+fprintf('  %-28s %12d\n',         'Injector elements',    N_elements);
+fprintf('  %-28s %12.2f  bar\n',  'Injector ΔP',          dP_ox/1e5);
+fprintf('  %-28s %12.2f  mm\n',   'LOx post ID',          D_post_ox_inner*1e3);
+fprintf('  %-28s %12.2f  mm\n',   'Fuel annulus OD',      D_fuel_outer*1e3);
+fprintf('=================================================================\n\n');
+
+
+%% =========================================================================
+%  SECTION 6: PLOTS
+% =========================================================================
+
+%  ── Plot 1: Nozzle profile (meridional cross-section) ────────────────────
+%
+%  Simplified conical convergent + Rao parabolic approximation for
+%  divergent. Compare with RPA.
+%  Real nozzle contours require method-of-characteristics.
+%  Here we use simple geometric interpolation for visualisation only.
+
+Dc_mm   = Dc*1e3;
+Dstar_mm= Dstar*1e3;
+De_mm   = De*1e3;
+Lc_mm   = Lc*1e3;
+Lconv_mm= 1.5 * Dstar_mm;    % convergent section ≈ 1.5 throat diameters
+Ldiv_mm = 3.0 * Dstar_mm * sqrt(eps);  % divergent length (approximate)
+
+n = 200;
+% Chamber (constant radius)
+x_ch  = linspace(0, Lc_mm, 50);
+r_ch  = ones(size(x_ch)) * Dc_mm/2;
+
+% Convergent (linear taper 30° half-angle typical)
+x_cv  = linspace(Lc_mm, Lc_mm+Lconv_mm, 50);
+r_cv  = linspace(Dc_mm/2, Dstar_mm/2, 50);
+
+% Divergent (parabolic approx)
+x_dv  = linspace(Lc_mm+Lconv_mm, Lc_mm+Lconv_mm+Ldiv_mm, 100);
+t_dv  = (x_dv - x_dv(1)) / (x_dv(end) - x_dv(1));
+r_dv  = Dstar_mm/2 + (De_mm/2 - Dstar_mm/2) * (3*t_dv.^2 - 2*t_dv.^3);  % smoothstep
+
+x_all = [x_ch, x_cv(2:end), x_dv(2:end)];
+r_all = [r_ch, r_cv(2:end), r_dv(2:end)];
+
+figure('Name','Nozzle Profile','NumberTitle','off','Color','white');
+patch([x_all, fliplr(x_all)], [r_all, -fliplr(r_all)], ...
+      [0.85 0.90 0.95], 'EdgeColor','none', 'FaceAlpha', 0.5);
+hold on;
+plot(x_all,  r_all, 'b-', 'LineWidth', 2);
+plot(x_all, -r_all, 'b-', 'LineWidth', 2);
+plot([0, x_all(end)], [0 0], 'k--', 'LineWidth', 0.8);  % centreline
+
+% Annotations
+xline(Lc_mm, ':', 'Color', [0.5 0.5 0.5], 'LineWidth', 1);
+xline(Lc_mm+Lconv_mm, ':', 'Color', [0.5 0.5 0.5], 'LineWidth', 1);
+text(Lc_mm/2, Dc_mm/2+1, 'Chamber', 'HorizontalAlignment','center','FontSize',9);
+text(Lc_mm+Lconv_mm/2, Dstar_mm+1, 'Conv.', 'HorizontalAlignment','center','FontSize',9);
+text(Lc_mm+Lconv_mm+Ldiv_mm/2, De_mm/2+1, 'Divergent', 'HorizontalAlignment','center','FontSize',9);
+
+xlabel('Axial position [mm]');
+ylabel('Radius [mm]');
+title('Nozzle Meridional Profile (simplified conical-parabolic)');
+grid on; axis equal;
+set(gca, 'FontSize', 10);
+
+
+%  ── Plot 2: Isp vs expansion ratio ───────────────────────────────────────
+
+eps_range = linspace(2, 200, 300);
+Isp_range = zeros(size(eps_range));
+
+for k = 1:length(eps_range)
+    Me_k = solve_mach(eps_range(k), gamma);
+    Pe_k = Pc * (1 + (gamma-1)/2 * Me_k^2)^(-gamma/(gamma-1));
+    Te_k = Tc * (1 + (gamma-1)/2 * Me_k^2)^(-1);
+    Ve_k = Me_k * sqrt(gamma * R * Te_k);
+    Astar_k = F_vac / (mdot_per_Astar * Ve_k + (Pe_k - Pa) * eps_range(k));
+    mdot_k  = mdot_per_Astar * Astar_k;
+    Isp_range(k) = F_vac / (mdot_k * g0);
+end
+
+figure('Name','Isp vs Expansion Ratio','NumberTitle','off','Color','white');
+plot(eps_range, Isp_range, 'b-', 'LineWidth', 2);
+hold on;
+xline(eps, 'r--', 'LineWidth', 1.5);
+yline(Isp_vac, 'r--', 'LineWidth', 1.5);
+scatter(eps, Isp_vac, 80, 'r', 'filled');
+text(eps+3, Isp_vac-5, sprintf('Design point\nε=%.0f, Isp=%.0f s', eps, Isp_vac), ...
+     'FontSize', 9, 'Color', 'r');
+xlabel('Expansion ratio ε = A_e / A^*');
+ylabel('I_{sp} [s]');
+title('Vacuum I_{sp} vs Expansion Ratio (CH_4/LOx)');
+grid on;
+set(gca, 'FontSize', 10);
+
+
+%  ── Plot 3: Injector ΔP stiffness map ────────────────────────────────────
+%
+%  Shows total orifice area vs pressure drop for both propellants.
+%  Used to select operating point that balances ΔP and orifice size.
+
+dP_range   = linspace(0.05, 0.40, 200) * Pc;   % 5–40% of Pc
+A_ox_r     = mdot_ox_elem   ./ (Cd_ox   * sqrt(2 * rho_ox   * dP_range));
+A_fuel_r   = mdot_fuel_elem ./ (Cd_fuel * sqrt(2 * rho_fuel * dP_range));
+
+figure('Name','Injector Sizing Map','NumberTitle','off','Color','white');
+yyaxis left
+plot(dP_range/1e5, A_ox_r*1e6, 'b-', 'LineWidth', 2);
+ylabel('Total LOx orifice area per element [mm²]');
+yyaxis right
+plot(dP_range/1e5, A_fuel_r*1e6, 'r-', 'LineWidth', 2);
+ylabel('Total CH_4 orifice area per element [mm²]');
+hold on;
+xline(dP_ox/1e5, 'k--', 'LineWidth', 1.5);
+text(dP_ox/1e5+0.3, max(A_ox_r*1e6)*0.85, sprintf('Design ΔP\n%.1f bar (%.0f%% Pc)', ...
+     dP_ox/1e5, dPinj_frac*100), 'FontSize',9);
+xlabel('Injector pressure drop ΔP [bar]');
+title('Orifice Area vs Injector Pressure Drop (per element)');
+legend({'LOx orifice area','CH_4 orifice area'}, 'Location','northeast');
+grid on;
+set(gca, 'FontSize', 10);
+
+
+%  ── Plot 4: Schematic of coaxial swirl element (2-D cross-section) ───────
+
+figure('Name','Coaxial Swirl Element Schematic','NumberTitle','off','Color','white');
+ax = axes; hold on; axis equal; axis off;
+
+% Draw concentric circles representing element cross-section
+theta = linspace(0, 2*pi, 200);
+
+% LOx post inner wall
+r1 = D_post_ox_inner/2 * 1e3;   % mm
+fill(r1*cos(theta), r1*sin(theta), [0.2 0.5 0.9], 'FaceAlpha', 0.3, 'EdgeColor', 'b', 'LineWidth', 1.5);
+
+% LOx post outer wall (annular steel)
+r2 = D_post_ox_outer/2 * 1e3;
+fill(r2*cos(theta), r2*sin(theta), [0.7 0.7 0.7], 'EdgeColor', [0.4 0.4 0.4], 'LineWidth', 1.5);
+fill(r1*cos(theta), r1*sin(theta), [0.2 0.5 0.9], 'FaceAlpha', 0.3, 'EdgeColor', 'none');
+
+% Fuel annulus
+r3 = D_fuel_outer/2 * 1e3;
+fill(r3*cos(theta), r3*sin(theta), [0.9 0.4 0.2], 'FaceAlpha', 0.2, 'EdgeColor', [0.8 0.2 0], 'LineWidth', 1.5);
+fill(r2*cos(theta), r2*sin(theta), [0.7 0.7 0.7], 'EdgeColor', 'none');
+fill(r1*cos(theta), r1*sin(theta), [0.2 0.5 0.9], 'FaceAlpha', 0.3, 'EdgeColor', 'none');
+
+% Tangential LOx slots (schematic, equally spaced)
+for s = 1:N_slots_ox
+    ang_s  = (s-1) * 2*pi / N_slots_ox;
+    xs     = (r1-0.5) * cos(ang_s);
+    ys     = (r1-0.5) * sin(ang_s);
+    slot_w = d_ox_slot * 1e3 / 2;
+    rectangle('Position', [xs-slot_w/2, ys-slot_w/2, slot_w, slot_w], ...
+              'Curvature', 0.5, 'FaceColor', [0.2 0.5 0.9], 'EdgeColor', 'k', 'LineWidth', 0.5);
+    % Arrow showing swirl direction
+    quiver(xs, ys, -sin(ang_s)*1.5, cos(ang_s)*1.5, 0, 'b', 'MaxHeadSize', 0.5);
+end
+
+% Labels
+text(0, 0, 'LOx\nswirl core', 'HorizontalAlignment','center', ...
+     'FontSize', 8, 'Color', [0.1 0.3 0.7], 'FontWeight','bold');
+text(0, r3+1.5, sprintf('CH_4 annulus\nOD=%.1f mm', D_fuel_outer*1e3), ...
+     'HorizontalAlignment','center', 'FontSize', 8, 'Color', [0.7 0.2 0]);
+text(r3+1, -r3-1, sprintf('Element pitch\n= %.1f mm', pitch*1e3), ...
+     'HorizontalAlignment','left', 'FontSize', 8, 'Color', [0 0 0]);
+
+% Pitch circle
+plot(pitch/2*1e3*cos(theta), pitch/2*1e3*sin(theta), 'k:', 'LineWidth', 0.8);
+
+title(sprintf('Coaxial Swirl Element Cross-Section (%d LOx slots, 1 CH_4 annulus)', N_slots_ox));
+xlim([-pitch/2*1e3-3, pitch/2*1e3+3]);
+ylim([-pitch/2*1e3-3, pitch/2*1e3+3]);
+set(gca, 'FontSize', 10);
+
+
+%% =========================================================================
+%  SECTION 7: HELPER FUNCTIONS
+% =========================================================================
+
+function AR = area_ratio(M, gam)
+    %  Isentropic area ratio [R1 eq. 3-13]
+    %    A/A* = (1/M) * [(2/(γ+1)) * (1 + (γ-1)/2 * M²)]^[(γ+1)/(2(γ-1))]
+    exp = (gam + 1) / (2 * (gam - 1));
+    base = (2 / (gam + 1)) * (1 + (gam - 1) / 2 * M^2);
+    AR = (1 / M) * base^exp;
+end
+
+function Me = solve_mach(eps_in, gam)
+    %  Solve area ratio for supersonic Mach by Newton-Raphson [R1 §3-4]
+    Me = 2.0;
+    for i = 1:300
+        f  = area_ratio(Me, gam) - eps_in;
+        df = (area_ratio(Me+1e-7, gam) - area_ratio(Me-1e-7, gam)) / 2e-7;
+        dM = f / df;
+        Me = max(Me - dM, 1.001);
+        if abs(dM) < 1e-11; break; end
+    end
+end
